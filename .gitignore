@@ -1,0 +1,11 @@
+.env
+nvidia_api.sh
+*.db
+data/*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/*.log
+.server.pid
+.DS_Store

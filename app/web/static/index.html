@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Gold Trader</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: #0b0e14; color: #e6e6e6;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8a92a6; margin-bottom: 16px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .badge.open { background: #1f4d2c; color: #7ee89b; }
+  .badge.closed { background: #3a2a1f; color: #e8b97e; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: #131722; border: 1px solid #232839; border-radius: 8px; padding: 12px 14px; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; color: #8a92a6; text-transform: uppercase; letter-spacing: .04em; }
+  .card .big { font-size: 22px; font-weight: 700; }
+  .pos { color: #7ee89b; } .neg { color: #ef6f6f; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #1e2230; white-space: nowrap; }
+  th { color: #8a92a6; font-weight: 600; }
+  section { margin-bottom: 28px; }
+  section h2 { font-size: 15px; color: #c9cedb; border-bottom: 1px solid #232839; padding-bottom: 6px; }
+  .reasoning { color: #8a92a6; max-width: 420px; white-space: normal; }
+  .scroll { overflow-x: auto; }
+  #status { color: #8a92a6; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>🤖 AI Gold Trader — XAUUSD Paper Trading</h1>
+  <div class="sub">DeepSeek V4 Pro vs the market. Simulation only — no real trades. <span id="status"></span></div>
+
+  <section>
+    <h2>Strategy Leaderboard</h2>
+    <div class="grid" id="leaderboard"></div>
+  </section>
+
+  <section>
+    <h2>Open Positions</h2>
+    <div class="scroll"><table id="positions"><thead><tr>
+      <th>Account</th><th>Strategy</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Confidence</th><th>Reasoning</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>Trade History</h2>
+    <div class="scroll"><table id="trades"><thead><tr>
+      <th>Time</th><th>Account</th><th>Dir</th><th>Status</th><th>Entry</th><th>Exit</th><th>PnL</th><th>R</th><th>Reasoning</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>AI Analysis Log</h2>
+    <div class="scroll"><table id="analyses"><thead><tr>
+      <th>Time</th><th>Price</th><th>Regime</th><th>Selected</th><th>Action</th><th>Conf</th><th>Accepted</th><th>Reasoning</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+<script>
+const fmt = (n, d=2) => (n === null || n === undefined) ? '-' : Number(n).toFixed(d);
+const pnlClass = (n) => (n === null || n === undefined) ? '' : (n >= 0 ? 'pos' : 'neg');
+const time = (s) => s ? new Date(s + (s.endsWith('Z') ? '' : 'Z')).toLocaleString() : '-';
+
+async function j(url) { const r = await fetch(url); return r.json(); }
+
+async function loadStatus() {
+  const s = await j('/api/status');
+  document.getElementById('status').textContent =
+    `${s.symbol} · market ${s.market_open ? 'OPEN' : 'CLOSED'} · analysis every ${s.analysis_interval_min}min`;
+}
+
+async function loadLeaderboard() {
+  const stats = await j('/api/stats');
+  const el = document.getElementById('leaderboard');
+  el.innerHTML = stats.map(s => `
+    <div class="card">
+      <h3>${s.account}</h3>
+      <div class="big ${pnlClass(s.return_pct)}">$${fmt(s.balance)} <span style="font-size:14px">(${s.return_pct >= 0 ? '+' : ''}${fmt(s.return_pct,1)}%)</span></div>
+      <div>Trades: ${s.total_trades} · Win rate: ${fmt(s.win_rate_pct,0)}%</div>
+      <div>Profit factor: ${s.profit_factor === null ? '-' : fmt(s.profit_factor)} · Avg R: ${fmt(s.avg_r_multiple)}</div>
+      <div>Max drawdown: ${fmt(s.max_drawdown_pct,1)}%</div>
+    </div>
+  `).join('');
+}
+
+async function loadPositions() {
+  const rows = await j('/api/positions');
+  document.querySelector('#positions tbody').innerHTML = rows.map(p => `
+    <tr>
+      <td>${p.account}</td><td>${p.strategy}</td><td>${p.direction}</td>
+      <td>${fmt(p.entry_price)}</td><td>${fmt(p.stop_loss)}</td><td>${fmt(p.take_profit)}</td>
+      <td>${fmt(p.confidence,2)}</td><td class="reasoning">${p.reasoning || ''}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="8" style="color:#8a92a6">No open positions</td></tr>';
+}
+
+async function loadTrades() {
+  const rows = await j('/api/trades?limit=100');
+  document.querySelector('#trades tbody').innerHTML = rows.map(t => `
+    <tr>
+      <td>${time(t.closed_at)}</td>
+      <td>${t.is_shadow ? t.strategy : 'ai_selected'}</td>
+      <td>${t.direction}</td>
+      <td><span class="badge closed">${t.status}</span></td>
+      <td>${fmt(t.entry_price)}</td><td>${fmt(t.exit_price)}</td>
+      <td class="${pnlClass(t.pnl)}">${fmt(t.pnl)}</td>
+      <td class="${pnlClass(t.r_multiple)}">${fmt(t.r_multiple)}</td>
+      <td class="reasoning">${t.reasoning || ''}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="9" style="color:#8a92a6">No trades yet</td></tr>';
+}
+
+async function loadAnalyses() {
+  const rows = await j('/api/analyses?limit=50');
+  document.querySelector('#analyses tbody').innerHTML = rows.map(a => `
+    <tr>
+      <td>${time(a.created_at)}</td>
+      <td>${fmt(a.price_at_analysis)}</td>
+      <td>${a.regime}</td>
+      <td>${a.selected_strategy}</td>
+      <td>${a.action}</td>
+      <td>${fmt(a.confidence,2)}</td>
+      <td>${a.accepted ? '✅' : '❌ ' + (a.reject_reason || '')}</td>
+      <td class="reasoning">${a.reasoning || a.selection_reasoning || ''}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="8" style="color:#8a92a6">No analyses yet</td></tr>';
+}
+
+async function refresh() {
+  try {
+    await Promise.all([loadStatus(), loadLeaderboard(), loadPositions(), loadTrades(), loadAnalyses()]);
+  } catch (e) { console.error(e); }
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
