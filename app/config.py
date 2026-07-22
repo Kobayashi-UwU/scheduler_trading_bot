@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +23,14 @@ class Settings(BaseSettings):
     dashboard_password: str = ""
 
     database_url: str = "sqlite:///./data/trading_bot.db"
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_postgres_scheme(cls, v: str) -> str:
+        # Railway/Heroku-style URLs use "postgres://"; SQLAlchemy needs "postgresql://"
+        if v.startswith("postgres://"):
+            return "postgresql://" + v[len("postgres://") :]
+        return v
 
 
 settings = Settings()

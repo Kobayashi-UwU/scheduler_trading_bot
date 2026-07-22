@@ -6,9 +6,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 from app.db.models import Base
 
-os.makedirs("data", exist_ok=True)
+is_sqlite = settings.database_url.startswith("sqlite")
+if is_sqlite:
+    os.makedirs("data", exist_ok=True)
 
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False})
+engine = create_engine(
+    settings.database_url,
+    connect_args={"check_same_thread": False} if is_sqlite else {},
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
