@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     nvidia_fallback_model: str = "deepseek-ai/deepseek-v4-pro"
     nvidia_api_url: str = "https://integrate.api.nvidia.com/v1/chat/completions"
     nvidia_timeout_sec: float = 180.0
-    nvidia_max_tokens: int = 1500
+    nvidia_max_tokens: int = 3000
 
     symbol: str = "GC=F"
     fallback_symbol: str = "XAUUSD=X"
@@ -38,5 +38,16 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-STRATEGIES = ["trend_following", "mean_reversion", "breakout", "sr_bounce"]
+STRATEGIES = [
+    "trend_following",
+    "mean_reversion",
+    "breakout",
+    "sr_bounce",
+    "ema_cross",
+    "rsi_extreme_reversal",
+    "daily_trend_pullback",
+    "atr_squeeze",
+    "macd_zero_cross",
+    "exhaustion_fade",
+]
 ALL_SELECTIONS = STRATEGIES + ["stay_out"]
