@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     nvidia_api_key: str
-    nvidia_model: str = "deepseek-ai/deepseek-v4-pro"
-    nvidia_fallback_model: str = "deepseek-ai/deepseek-v4-flash"
+    nvidia_model: str = "deepseek-ai/deepseek-v4-flash"
+    nvidia_fallback_model: str = "deepseek-ai/deepseek-v4-pro"
     nvidia_api_url: str = "https://integrate.api.nvidia.com/v1/chat/completions"
     nvidia_timeout_sec: float = 180.0
     nvidia_max_tokens: int = 1500

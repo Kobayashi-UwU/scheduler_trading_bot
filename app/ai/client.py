@@ -13,12 +13,14 @@ class AIClientError(Exception):
     pass
 
 
-def _headers() -> dict[str, str]:
-    return {
+def _headers(*, stream: bool) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {settings.nvidia_api_key}",
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
     }
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    return headers
 
 
 def _timeout() -> httpx.Timeout:
@@ -33,8 +35,7 @@ def _timeout() -> httpx.Timeout:
 def _build_payload(
     model: str, system_prompt: str, user_prompt: str, *, stream: bool
 ) -> dict:
-    # NVIDIA NIM DeepSeek V4 models hang on non-streaming requests unless
-    # chat_template_kwargs explicitly disables reasoning mode.
+    # NVIDIA NIM DeepSeek V4 models need explicit non-thinking kwargs.
     return {
         "model": model,
         "messages": [
@@ -52,6 +53,19 @@ def _build_payload(
     }
 
 
+def _extract_text_from_choice(choice: dict) -> str | None:
+    delta = choice.get("delta") or {}
+    message = choice.get("message") or {}
+    for part in (
+        delta.get("content"),
+        message.get("content"),
+        choice.get("text"),
+    ):
+        if isinstance(part, str) and part:
+            return part
+    return None
+
+
 def _parse_stream(response: httpx.Response) -> str:
     chunks: list[str] = []
     for line in response.iter_lines():
@@ -65,12 +79,22 @@ def _parse_stream(response: httpx.Response) -> str:
         except json.JSONDecodeError:
             continue
         for choice in event.get("choices", []):
-            delta = choice.get("delta", {})
-            if content := delta.get("content"):
-                chunks.append(content)
+            if text := _extract_text_from_choice(choice):
+                chunks.append(text)
     text = "".join(chunks).strip()
     if not text:
         raise ValueError("empty streaming response")
+    return text
+
+
+def _parse_non_stream(data: dict) -> str:
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"unexpected completion payload: {data}") from exc
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty non-streaming response")
     return text
 
 
@@ -80,23 +104,43 @@ def _call_once(
     system_prompt: str,
     user_prompt: str,
 ) -> str:
-    payload = _build_payload(model, system_prompt, user_prompt, stream=True)
-    with client.stream(
-        "POST",
+    # Prefer non-streaming for flash-tier models; they respond quickly and
+    # avoid NVIDIA SSE quirks. Use streaming for slower pro-tier models.
+    use_stream = model.endswith("-pro")
+    if use_stream:
+        payload = _build_payload(model, system_prompt, user_prompt, stream=True)
+        with client.stream(
+            "POST",
+            settings.nvidia_api_url,
+            json=payload,
+            headers=_headers(stream=True),
+        ) as response:
+            response.raise_for_status()
+            try:
+                return _parse_stream(response)
+            except ValueError:
+                log.warning("streaming returned no content for %s, retrying non-stream", model)
+
+    payload = _build_payload(model, system_prompt, user_prompt, stream=False)
+    response = client.post(
         settings.nvidia_api_url,
         json=payload,
-        headers=_headers(),
-    ) as response:
-        response.raise_for_status()
-        return _parse_stream(response)
+        headers=_headers(stream=False),
+    )
+    response.raise_for_status()
+    return _parse_non_stream(response.json())
 
 
 def _models_to_try() -> list[str]:
-    models = [settings.nvidia_model]
-    fallback = settings.nvidia_fallback_model.strip()
-    if fallback and fallback not in models:
-        models.append(fallback)
-    return models
+    candidates = [settings.nvidia_model, settings.nvidia_fallback_model]
+    ordered: list[str] = []
+    for model in candidates:
+        model = model.strip()
+        if model and model not in ordered:
+            ordered.append(model)
+    # Flash responds reliably on NVIDIA free tier; pro often hangs indefinitely.
+    ordered.sort(key=lambda m: m.endswith("-pro"))
+    return ordered
 
 
 def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) -> str:
@@ -106,13 +150,14 @@ def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) ->
 
     with httpx.Client(timeout=_timeout()) as client:
         for model in models:
-            for attempt in range(max_retries + 1):
+            retries = 1 if model.endswith("-pro") else max_retries
+            for attempt in range(retries + 1):
                 try:
                     log.info(
                         "Calling NVIDIA model %s (attempt %d/%d)",
                         model,
                         attempt + 1,
-                        max_retries + 1,
+                        retries + 1,
                     )
                     return _call_once(client, model, system_prompt, user_prompt)
                 except Exception as exc:
@@ -123,7 +168,7 @@ def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) ->
                         attempt + 1,
                         exc,
                     )
-                    if attempt < max_retries:
+                    if attempt < retries:
                         time.sleep(2**attempt)
 
     raise AIClientError(f"DeepSeek call failed after retries: {last_error}")
