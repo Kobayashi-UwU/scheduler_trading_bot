@@ -23,14 +23,6 @@ def _headers(*, stream: bool) -> dict[str, str]:
     return headers
 
 
-def _timeout() -> httpx.Timeout:
-    return httpx.Timeout(
-        connect=30.0,
-        read=settings.nvidia_timeout_sec,
-        write=30.0,
-        pool=30.0,
-    )
-
 
 def _build_payload(
     model: str, system_prompt: str, user_prompt: str, *, stream: bool
@@ -98,11 +90,18 @@ def _parse_non_stream(data: dict) -> str:
     return text
 
 
+def _timeout_for_model(model: str) -> httpx.Timeout:
+    read = 60.0 if model.endswith("-pro") else settings.nvidia_timeout_sec
+    return httpx.Timeout(connect=30.0, read=read, write=30.0, pool=30.0)
+
+
 def _call_once(
     client: httpx.Client,
     model: str,
     system_prompt: str,
     user_prompt: str,
+    *,
+    timeout: httpx.Timeout,
 ) -> str:
     # Prefer non-streaming for flash-tier models; they respond quickly and
     # avoid NVIDIA SSE quirks. Use streaming for slower pro-tier models.
@@ -114,6 +113,7 @@ def _call_once(
             settings.nvidia_api_url,
             json=payload,
             headers=_headers(stream=True),
+            timeout=timeout,
         ) as response:
             response.raise_for_status()
             try:
@@ -126,13 +126,18 @@ def _call_once(
         settings.nvidia_api_url,
         json=payload,
         headers=_headers(stream=False),
+        timeout=timeout,
     )
     response.raise_for_status()
     return _parse_non_stream(response.json())
 
 
 def _models_to_try() -> list[str]:
-    candidates = [settings.nvidia_model, settings.nvidia_fallback_model]
+    candidates = [
+        settings.nvidia_model,
+        settings.nvidia_fallback_model,
+        "deepseek-ai/deepseek-v4-flash",
+    ]
     ordered: list[str] = []
     for model in candidates:
         model = model.strip()
@@ -148,9 +153,10 @@ def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) ->
     models = _models_to_try()
     last_error: Exception | None = None
 
-    with httpx.Client(timeout=_timeout()) as client:
+    with httpx.Client() as client:
         for model in models:
-            retries = 1 if model.endswith("-pro") else max_retries
+            retries = 0 if model.endswith("-pro") else max_retries
+            timeout = _timeout_for_model(model)
             for attempt in range(retries + 1):
                 try:
                     log.info(
@@ -159,7 +165,9 @@ def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) ->
                         attempt + 1,
                         retries + 1,
                     )
-                    return _call_once(client, model, system_prompt, user_prompt)
+                    return _call_once(
+                        client, model, system_prompt, user_prompt, timeout=timeout
+                    )
                 except Exception as exc:
                     last_error = exc
                     log.warning(
