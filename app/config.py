@@ -7,7 +7,10 @@ class Settings(BaseSettings):
 
     nvidia_api_key: str
     nvidia_model: str = "deepseek-ai/deepseek-v4-pro"
+    nvidia_fallback_model: str = "deepseek-ai/deepseek-v4-flash"
     nvidia_api_url: str = "https://integrate.api.nvidia.com/v1/chat/completions"
+    nvidia_timeout_sec: float = 180.0
+    nvidia_max_tokens: int = 1500
 
     symbol: str = "GC=F"
     fallback_symbol: str = "XAUUSD=X"
