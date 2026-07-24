@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     nvidia_api_url: str = "https://integrate.api.nvidia.com/v1/chat/completions"
     nvidia_timeout_sec: float = 180.0
     nvidia_max_tokens: int = 3000
+    nvidia_retry_backoff_cap_sec: float = 30.0
 
     symbol: str = "GC=F"
     fallback_symbol: str = "XAUUSD=X"

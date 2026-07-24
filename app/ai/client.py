@@ -148,35 +148,54 @@ def _models_to_try() -> list[str]:
     return ordered
 
 
-def call_deepseek(system_prompt: str, user_prompt: str, max_retries: int = 2) -> str:
-    """Call DeepSeek via the NVIDIA endpoint. Returns raw text content."""
+def _is_retryable(exc: Exception) -> bool:
+    """Transient failures (timeouts, network errors, rate limits, empty bodies) are
+    worth retrying — the NVIDIA free tier is flaky but usually recovers. A 4xx other
+    than 429 means the request itself is broken (bad key, bad payload); retrying that
+    forever would just spin a thread without ever succeeding."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, ValueError):
+        return True
+    return False
+
+
+def call_deepseek(system_prompt: str, user_prompt: str) -> str:
+    """Call DeepSeek via the NVIDIA endpoint. Returns raw text content.
+
+    Keeps retrying transient failures (timeouts, 5xx, rate limits, empty responses)
+    indefinitely with capped exponential backoff, cycling through the configured
+    models each pass — a flaky free-tier API call should never silently give up on a
+    cycle. Only a non-retryable error (e.g. invalid API key, malformed request) raises
+    immediately.
+    """
     models = _models_to_try()
-    last_error: Exception | None = None
+    attempt = 0
 
     with httpx.Client() as client:
-        for model in models:
-            retries = 0 if model.endswith("-pro") else max_retries
-            timeout = _timeout_for_model(model)
-            for attempt in range(retries + 1):
+        while True:
+            for model in models:
+                attempt += 1
+                timeout = _timeout_for_model(model)
                 try:
-                    log.info(
-                        "Calling NVIDIA model %s (attempt %d/%d)",
-                        model,
-                        attempt + 1,
-                        retries + 1,
-                    )
+                    log.info("Calling NVIDIA model %s (attempt %d)", model, attempt)
                     return _call_once(
                         client, model, system_prompt, user_prompt, timeout=timeout
                     )
                 except Exception as exc:
-                    last_error = exc
+                    if not _is_retryable(exc):
+                        raise AIClientError(
+                            f"DeepSeek call failed (non-retryable): {exc}"
+                        ) from exc
+                    backoff = min(2 ** min(attempt, 6), settings.nvidia_retry_backoff_cap_sec)
                     log.warning(
-                        "DeepSeek call failed for %s (attempt %d): %s",
+                        "DeepSeek call failed for %s (attempt %d): %s — retrying in %.0fs",
                         model,
-                        attempt + 1,
+                        attempt,
                         exc,
+                        backoff,
                     )
-                    if attempt < retries:
-                        time.sleep(2**attempt)
-
-    raise AIClientError(f"DeepSeek call failed after retries: {last_error}")
+                    time.sleep(backoff)
