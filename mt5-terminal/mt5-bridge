@@ -1,0 +1,37 @@
+#!/usr/bin/with-contenv bash
+# linuxserver.io "custom service" (see /custom-services.d docs): runs LAST,
+# after every built-in service (KasmVNC/X, and the image's own MT5 autostart
+# via /Metatrader/start.sh) is already up -- unlike a raw CMD/entrypoint
+# override, which runs *before* any of that and therefore lacks a working
+# DISPLAY, the correct user, or a ready Wine prefix (confirmed the hard way:
+# every "wine python" call failed with "ShellExecuteEx failed: File not
+# found" when attempted pre-init). s6 supervises this as a long-running
+# service and restarts it if it ever exits.
+#
+# start.sh's own final step (python3 -m mt5linux ... -w wine python.exe)
+# never works: its unpinned "pip install mt5linux>=0.1.9" resolves to the
+# latest release, which dropped the "-w" flag that command depends on. Rather
+# than fight that version drift, this starts the actual rpyc bridge directly:
+# a plain SlaveService running under Wine's python (so "import MetaTrader5"
+# succeeds), which is exactly what the mt5linux CLIENT side (rpyc.classic.
+# connect + "import MetaTrader5 as mt5") expects on the other end.
+
+i=0
+while [ $i -lt 60 ]; do
+  s6-setuidgid abc wine python -c "import rpyc, MetaTrader5" 2>/dev/null && break
+  i=$((i + 1))
+  sleep 5
+done
+
+exec s6-setuidgid abc wine python -c "
+import rpyc
+from rpyc.utils.server import ThreadedServer
+from rpyc.core.service import SlaveService
+ThreadedServer(
+    SlaveService,
+    hostname='0.0.0.0',
+    port=8001,
+    reuse_addr=True,
+    protocol_config={'allow_all_attrs': True},
+).start()
+"
