@@ -58,6 +58,11 @@ class Trade(Base):
 
     strategy: Mapped[str] = mapped_column(String)  # trend_following, etc.
     is_shadow: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Canonical account identity. Paper: "ai_selected" or a strategy name.
+    # Real tier: "real_ai_selected" / "real_trend_following". Backfilled from
+    # (is_shadow, strategy) for rows written before this column existed; the
+    # (is_shadow, strategy) pair is no longer used for account filtering.
+    account: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     analysis_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     direction: Mapped[str] = mapped_column(String)  # LONG/SHORT
@@ -68,6 +73,11 @@ class Trade(Base):
     take_profit: Mapped[float] = mapped_column(Float)
     size: Mapped[float] = mapped_column(Float)
     risk_amount: Mapped[float] = mapped_column(Float)
+
+    # Real tier only: broker-shaped sizing. Paper trades leave these NULL.
+    lots: Mapped[float | None] = mapped_column(Float, nullable=True)
+    margin_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -84,3 +94,31 @@ class EquityPoint(Base):
     created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now())
     account: Mapped[str] = mapped_column(String)  # "ai_selected", or strategy name
     balance: Mapped[float] = mapped_column(Float)
+
+
+class TradeSkip(Base):
+    """A signal a real account could not act on (risk cap, margin, lot limits).
+
+    Paper accounts never skip for sizing reasons, so this is real-tier only. It
+    exists so the dashboard can show what a $100 account had to pass over
+    instead of the trade silently vanishing.
+    """
+
+    __tablename__ = "trade_skips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now())
+
+    account: Mapped[str] = mapped_column(String, index=True)
+    strategy: Mapped[str] = mapped_column(String)
+    analysis_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    action: Mapped[str] = mapped_column(String)
+    reason: Mapped[str] = mapped_column(String)
+    balance: Mapped[float] = mapped_column(Float)
+
+    entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    intended_lots: Mapped[float | None] = mapped_column(Float, nullable=True)
+    intended_risk: Mapped[float | None] = mapped_column(Float, nullable=True)
+    intended_risk_pct: Mapped[float | None] = mapped_column(Float, nullable=True)

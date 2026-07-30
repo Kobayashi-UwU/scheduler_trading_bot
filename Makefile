@@ -1,7 +1,13 @@
 VENV := .venv
 PYTHON := $(VENV)/bin/python
-PIP := $(VENV)/bin/pip
-UVICORN := $(VENV)/bin/uvicorn
+# PIP_USER=0: some environments (e.g. Replit) point PIP_CONFIG_FILE at a config
+# that forces --user installs, which a venv rejects outright.
+PIP := PIP_USER=0 $(VENV)/bin/python -m pip
+# Invoke uvicorn as a module rather than via $(VENV)/bin/uvicorn: pip writes that
+# console script with a "#!/usr/bin/env python3" shebang when the venv's python is
+# a symlink (Nix/Replit), so it resolves to the *system* python and can't see the
+# venv's packages.
+UVICORN := $(PYTHON) -m uvicorn
 HOST := 0.0.0.0
 PORT := 8000
 PID_FILE := .server.pid
@@ -15,6 +21,7 @@ venv:
 install: venv
 	$(PIP) install -q --upgrade pip
 	$(PIP) install -q -r requirements.txt
+	$(PIP) install -q --no-deps mt5linux==0.1.9
 
 up: install
 	mkdir -p logs data

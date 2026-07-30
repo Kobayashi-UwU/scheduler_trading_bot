@@ -3,14 +3,12 @@ import logging
 from app.ai.client import AIClientError, call_deepseek
 from app.ai.parser import parse_and_validate
 from app.ai.prompts import SYSTEM_PROMPT, build_market_briefing
-from app.config import STRATEGIES, settings
+from app.config import PAPER_ACCOUNTS, settings
 from app.data.indicators import summarize
 from app.data.yahoo import fetch_all_timeframes, is_market_open
 from app.db.database import get_session
 from app.db.models import Analysis
 from app.trading.engine import (
-    AI_SELECTED_ACCOUNT,
-    ALL_ACCOUNTS,
     get_open_position,
     get_recent_trades,
     manage_open_positions,
@@ -54,9 +52,12 @@ def run_analysis_cycle() -> None:
 
     session = get_session()
     try:
+        # Paper accounts only: the real tier mirrors these same signals, so adding
+        # it here would change the prompt and break continuity with the analyses
+        # already logged by the running experiment.
         open_positions_by_strategy = {}
         recent_trades_by_strategy = {}
-        for account in ALL_ACCOUNTS:
+        for account in PAPER_ACCOUNTS:
             pos = get_open_position(session, account)
             open_positions_by_strategy[account] = (
                 {

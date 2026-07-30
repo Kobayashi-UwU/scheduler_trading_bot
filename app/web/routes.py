@@ -1,14 +1,34 @@
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
-from app.config import settings
+from app.config import ALL_ACCOUNTS, PAPER_ACCOUNTS, REAL_ACCOUNTS, settings
 from app.data.yahoo import fetch_candles, is_market_open
 from app.db.database import get_session
-from app.db.models import Analysis, Trade, TradeStatus
-from app.trading.engine import ALL_ACCOUNTS, get_open_position
-from app.trading.stats import compute_all_stats, compute_stats
+from app.db.models import Analysis, Trade, TradeSkip, TradeStatus
+from app.trading.engine import get_open_position
+from app.trading.stats import compute_all_stats, compute_real_stats, compute_stats
 
 router = APIRouter()
+
+
+def _position_payload(account: str, pos: Trade) -> dict:
+    return {
+        "id": pos.id,
+        "account": account,
+        "strategy": pos.strategy,
+        "direction": pos.direction,
+        "entry_price": pos.entry_price,
+        "stop_loss": pos.stop_loss,
+        "take_profit": pos.take_profit,
+        "size": pos.size,
+        "lots": pos.lots,
+        "risk_amount": pos.risk_amount,
+        "risk_pct": pos.risk_pct,
+        "margin_used": pos.margin_used,
+        "confidence": pos.confidence,
+        "reasoning": pos.reasoning,
+        "opened_at": pos.created_at,
+    }
 
 
 @router.get("/api/status")
@@ -17,7 +37,18 @@ def status():
         "symbol": settings.symbol,
         "market_open": is_market_open(),
         "analysis_interval_min": settings.analysis_interval_min,
-        "accounts": ALL_ACCOUNTS,
+        "accounts": PAPER_ACCOUNTS,
+        "real_accounts": REAL_ACCOUNTS,
+        "real_enabled": settings.real_enabled and bool(REAL_ACCOUNTS),
+        "real_config": {
+            "start_balance": settings.real_start_balance,
+            "leverage": settings.real_leverage,
+            "min_lot": settings.real_min_lot,
+            "lot_step": settings.real_lot_step,
+            "contract_size": settings.real_contract_size,
+            "risk_per_trade_pct": settings.real_risk_per_trade * 100,
+            "max_risk_pct": settings.real_max_risk_pct * 100,
+        },
     }
 
 
@@ -43,26 +74,71 @@ def stats_for_account(account: str):
 
 @router.get("/api/positions")
 def positions():
+    """Paper-tier open positions (the original endpoint)."""
     session = get_session()
     try:
-        out = []
-        for account in ALL_ACCOUNTS:
-            pos = get_open_position(session, account)
-            if pos:
-                out.append(
-                    {
-                        "account": account,
-                        "strategy": pos.strategy,
-                        "direction": pos.direction,
-                        "entry_price": pos.entry_price,
-                        "stop_loss": pos.stop_loss,
-                        "take_profit": pos.take_profit,
-                        "confidence": pos.confidence,
-                        "reasoning": pos.reasoning,
-                        "opened_at": pos.created_at,
-                    }
-                )
-        return out
+        return [
+            _position_payload(account, pos)
+            for account in PAPER_ACCOUNTS
+            if (pos := get_open_position(session, account))
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/api/real/stats")
+def real_stats():
+    session = get_session()
+    try:
+        return compute_real_stats(session)
+    finally:
+        session.close()
+
+
+@router.get("/api/real/positions")
+def real_positions():
+    session = get_session()
+    try:
+        return [
+            _position_payload(account, pos)
+            for account in REAL_ACCOUNTS
+            if (pos := get_open_position(session, account))
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/api/executor/status")
+def executor_status():
+    """Health of the MT5 mirror (last sync, last action, errors per account)."""
+    from app.trading.executor import STATUS
+
+    return {"enabled": settings.executor_enabled, **STATUS}
+
+
+@router.get("/api/real/skips")
+def real_skips(limit: int = Query(50, le=200)):
+    """Signals the real accounts could not act on (risk cap, margin, lot limits)."""
+    session = get_session()
+    try:
+        stmt = select(TradeSkip).order_by(TradeSkip.created_at.desc()).limit(limit)
+        return [
+            {
+                "id": s.id,
+                "created_at": s.created_at,
+                "account": s.account,
+                "strategy": s.strategy,
+                "action": s.action,
+                "reason": s.reason,
+                "balance": s.balance,
+                "entry_price": s.entry_price,
+                "stop_loss": s.stop_loss,
+                "intended_lots": s.intended_lots,
+                "intended_risk": s.intended_risk,
+                "intended_risk_pct": s.intended_risk_pct,
+            }
+            for s in session.execute(stmt).scalars().all()
+        ]
     finally:
         session.close()
 
@@ -72,15 +148,19 @@ def trades(account: str | None = Query(None), limit: int = Query(100, le=500)):
     session = get_session()
     try:
         stmt = select(Trade).where(Trade.status != TradeStatus.OPEN.value)
-        if account and account != "ai_selected":
-            stmt = stmt.where(Trade.is_shadow.is_(True), Trade.strategy == account)
-        elif account == "ai_selected":
-            stmt = stmt.where(Trade.is_shadow.is_(False))
+        if account:
+            if account not in ALL_ACCOUNTS:
+                raise HTTPException(status_code=404, detail="unknown account")
+            stmt = stmt.where(Trade.account == account)
+        else:
+            # Default view stays the paper experiment.
+            stmt = stmt.where(Trade.account.in_(PAPER_ACCOUNTS))
         stmt = stmt.order_by(Trade.closed_at.desc()).limit(limit)
         rows = session.execute(stmt).scalars().all()
         return [
             {
                 "id": t.id,
+                "account": t.account,
                 "strategy": t.strategy,
                 "is_shadow": t.is_shadow,
                 "direction": t.direction,
@@ -89,6 +169,11 @@ def trades(account: str | None = Query(None), limit: int = Query(100, le=500)):
                 "exit_price": t.exit_price,
                 "stop_loss": t.stop_loss,
                 "take_profit": t.take_profit,
+                "size": t.size,
+                "lots": t.lots,
+                "risk_amount": t.risk_amount,
+                "risk_pct": t.risk_pct,
+                "margin_used": t.margin_used,
                 "pnl": t.pnl,
                 "r_multiple": t.r_multiple,
                 "confidence": t.confidence,

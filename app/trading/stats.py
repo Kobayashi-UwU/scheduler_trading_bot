@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.config import PAPER_ACCOUNTS, REAL_ACCOUNTS, start_balance_for
 from app.trading.engine import _account_filter, get_balance
 from app.db.models import Trade, TradeStatus
 
@@ -31,14 +31,27 @@ def compute_stats(session: Session, account: str) -> dict:
         else 0.0
     )
 
+    start_balance = start_balance_for(account)
     balance = get_balance(session, account)
-    equity_curve = _equity_curve(closed)
+    equity_curve = _equity_curve(closed, start_balance)
     max_dd = _max_drawdown(equity_curve)
+
+    # Real-tier extras: what risk the lot minimum actually forced on us.
+    risk_pcts = [t.risk_pct for t in trades if t.risk_pct is not None]
+    lot_extras = (
+        {
+            "avg_risk_pct": round(sum(risk_pcts) / len(risk_pcts), 1),
+            "max_risk_pct": round(max(risk_pcts), 1),
+        }
+        if risk_pcts
+        else {}
+    )
 
     return {
         "account": account,
+        "start_balance": round(start_balance, 2),
         "balance": round(balance, 2),
-        "return_pct": round((balance - settings.start_balance) / settings.start_balance * 100, 2),
+        "return_pct": round((balance - start_balance) / start_balance * 100, 2),
         "total_trades": len(closed),
         "wins": len(wins),
         "losses": len(losses),
@@ -47,12 +60,13 @@ def compute_stats(session: Session, account: str) -> dict:
         "expectancy": round(expectancy, 2),
         "avg_r_multiple": round(avg_r, 2),
         "max_drawdown_pct": round(max_dd, 2),
+        **lot_extras,
     }
 
 
-def _equity_curve(closed_trades: list[Trade]) -> list[float]:
+def _equity_curve(closed_trades: list[Trade], start_balance: float) -> list[float]:
     ordered = sorted(closed_trades, key=lambda t: t.closed_at or t.created_at)
-    curve = [settings.start_balance]
+    curve = [start_balance]
     for t in ordered:
         curve.append(curve[-1] + t.pnl)
     return curve
@@ -71,6 +85,9 @@ def _max_drawdown(curve: list[float]) -> float:
 
 
 def compute_all_stats(session: Session) -> list[dict]:
-    from app.trading.engine import ALL_ACCOUNTS
+    """Paper tier only — this backs the original /api/stats leaderboard."""
+    return [compute_stats(session, account) for account in PAPER_ACCOUNTS]
 
-    return [compute_stats(session, account) for account in ALL_ACCOUNTS]
+
+def compute_real_stats(session: Session) -> list[dict]:
+    return [compute_stats(session, account) for account in REAL_ACCOUNTS]

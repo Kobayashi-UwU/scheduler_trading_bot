@@ -5,26 +5,48 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.parser import ParsedCycle, StrategySignal
-from app.config import STRATEGIES, settings
-from app.db.models import EquityPoint, Trade, TradeStatus
+from app.config import (
+    AI_SELECTED_ACCOUNT,
+    ALL_ACCOUNTS,
+    PAPER_ACCOUNTS,
+    REAL_ACCOUNTS,
+    is_real_account,
+    real_source_for,
+    settings,
+    start_balance_for,
+)
+from app.db.models import EquityPoint, Trade, TradeSkip, TradeStatus
+from app.trading.sizing import size_real
 
 log = logging.getLogger("engine")
 
-AI_SELECTED_ACCOUNT = "ai_selected"
-ALL_ACCOUNTS = [AI_SELECTED_ACCOUNT] + STRATEGIES
+# Re-exported for callers that historically imported these from the engine.
+__all__ = [
+    "AI_SELECTED_ACCOUNT",
+    "ALL_ACCOUNTS",
+    "PAPER_ACCOUNTS",
+    "REAL_ACCOUNTS",
+    "get_balance",
+    "get_open_position",
+    "get_recent_trades",
+    "manage_open_positions",
+    "process_cycle",
+]
 
 
 def _account_filter(session: Session, account: str):
-    """Trades belonging to a given virtual account."""
-    if account == AI_SELECTED_ACCOUNT:
-        return select(Trade).where(Trade.is_shadow.is_(False))
-    return select(Trade).where(Trade.is_shadow.is_(True), Trade.strategy == account)
+    """Trades belonging to a given virtual account.
+
+    Identity is the `account` column (backfilled by app/db/migrations.py); the
+    legacy (is_shadow, strategy) pair is no longer consulted.
+    """
+    return select(Trade).where(Trade.account == account)
 
 
 def get_balance(session: Session, account: str) -> float:
     trades = session.execute(_account_filter(session, account)).scalars().all()
     realized = sum(t.pnl for t in trades if t.pnl is not None)
-    return settings.start_balance + realized
+    return start_balance_for(account) + realized
 
 
 def get_open_position(session: Session, account: str) -> Trade | None:
@@ -53,6 +75,37 @@ def get_recent_trades(session: Session, account: str, limit: int = 5) -> list[di
     ]
 
 
+def _log_skip(
+    session: Session,
+    *,
+    account: str,
+    strategy: str,
+    signal: StrategySignal,
+    analysis_id: int | None,
+    balance: float,
+    reason: str,
+    lots: float,
+    risk_amount: float,
+    risk_pct: float,
+) -> None:
+    session.add(
+        TradeSkip(
+            account=account,
+            strategy=strategy,
+            analysis_id=analysis_id,
+            action=signal.action,
+            reason=reason,
+            balance=balance,
+            entry_price=signal.entry,
+            stop_loss=signal.stop_loss,
+            intended_lots=lots,
+            intended_risk=risk_amount,
+            intended_risk_pct=risk_pct * 100,
+        )
+    )
+    log.info("SKIP %s %s: %s", account, strategy, reason)
+
+
 def _open_trade(
     session: Session,
     *,
@@ -67,13 +120,42 @@ def _open_trade(
 
     direction = "LONG" if signal.action == "BUY" else "SHORT"
     balance = get_balance(session, account)
-    risk_amount = balance * settings.risk_per_trade
-    risk_distance = abs(signal.entry - signal.stop_loss)
-    size = risk_amount / risk_distance if risk_distance > 0 else 0
+
+    if is_real_account(account):
+        # Broker-shaped sizing: fixed lot steps, hard minimum, margin check.
+        sizing = size_real(balance, signal.entry, signal.stop_loss)
+        if not sizing.ok:
+            _log_skip(
+                session,
+                account=account,
+                strategy=strategy,
+                signal=signal,
+                analysis_id=analysis_id,
+                balance=balance,
+                reason=sizing.reason,
+                lots=sizing.lots,
+                risk_amount=sizing.risk_amount,
+                risk_pct=sizing.risk_pct,
+            )
+            return None
+        size = sizing.size
+        risk_amount = sizing.risk_amount
+        lots = sizing.lots
+        margin_used = sizing.margin
+        risk_pct = sizing.risk_pct * 100
+    else:
+        # Paper tier: continuous sizing, always hits the risk target exactly.
+        risk_amount = balance * settings.risk_per_trade
+        risk_distance = abs(signal.entry - signal.stop_loss)
+        size = risk_amount / risk_distance if risk_distance > 0 else 0
+        lots = None
+        margin_used = None
+        risk_pct = None
 
     trade = Trade(
         strategy=strategy,
         is_shadow=is_shadow,
+        account=account,
         analysis_id=analysis_id,
         direction=direction,
         status=TradeStatus.OPEN.value,
@@ -82,18 +164,27 @@ def _open_trade(
         take_profit=signal.take_profit,
         size=size,
         risk_amount=risk_amount,
+        lots=lots,
+        margin_used=margin_used,
+        risk_pct=risk_pct,
         confidence=signal.confidence,
         reasoning=signal.reasoning,
     )
     session.add(trade)
     session.flush()
-    log.info("OPEN %s %s %s @ %.2f (SL %.2f TP %.2f)", account, strategy, direction,
-              signal.entry, signal.stop_loss, signal.take_profit)
+    if lots is not None:
+        log.info(
+            "OPEN %s %s %s %.2f lot @ %.2f (SL %.2f TP %.2f) risk %.2f (%.1f%%) margin %.2f",
+            account, strategy, direction, lots, signal.entry, signal.stop_loss,
+            signal.take_profit, risk_amount, risk_pct, margin_used,
+        )
+    else:
+        log.info("OPEN %s %s %s @ %.2f (SL %.2f TP %.2f)", account, strategy, direction,
+                  signal.entry, signal.stop_loss, signal.take_profit)
     return trade
 
 
 def _close_trade(session: Session, trade: Trade, exit_price: float, status: str) -> None:
-    risk_distance = abs(trade.entry_price - trade.stop_loss)
     if trade.direction == "LONG":
         pnl = trade.size * (exit_price - trade.entry_price)
     else:
@@ -104,11 +195,12 @@ def _close_trade(session: Session, trade: Trade, exit_price: float, status: str)
     trade.r_multiple = pnl / trade.risk_amount if trade.risk_amount else 0
     trade.status = status
     trade.closed_at = dt.datetime.utcnow()
-    log.info("CLOSE trade#%s %s %s pnl=%.2f", trade.id, trade.strategy, status, pnl)
+    log.info("CLOSE trade#%s %s %s pnl=%.2f", trade.id, trade.account or trade.strategy,
+             status, pnl)
 
 
 def manage_open_positions(session: Session, current_price: float) -> None:
-    """Check every open trade (real + shadow) against SL/TP using the latest price."""
+    """Check every open trade (paper + real) against SL/TP using the latest price."""
     open_trades = session.execute(
         select(Trade).where(Trade.status == TradeStatus.OPEN.value)
     ).scalars().all()
@@ -137,40 +229,80 @@ def manage_open_positions(session: Session, current_price: float) -> None:
         session.commit()
 
 
+def _apply_signal(
+    session: Session,
+    *,
+    account: str,
+    strategy: str,
+    signal: StrategySignal | None,
+    is_shadow: bool,
+    current_price: float,
+    analysis_id: int,
+) -> None:
+    """Apply one validated signal to one account."""
+    if signal is None or not signal.ok:
+        return
+
+    existing = get_open_position(session, account)
+    if signal.action == "CLOSE" and existing:
+        _close_trade(session, existing, current_price, TradeStatus.CLOSED_MANUAL.value)
+    elif signal.action in ("BUY", "SELL") and not existing:
+        _open_trade(
+            session,
+            strategy=strategy,
+            is_shadow=is_shadow,
+            account=account,
+            signal=signal,
+            analysis_id=analysis_id,
+        )
+
+
 def process_cycle(session: Session, parsed: ParsedCycle, current_price: float, analysis_id: int) -> None:
-    """Apply one AI analysis cycle: manage shadow accounts for every strategy, and the
-    single ai_selected account for whichever strategy the AI picked as live."""
+    """Apply one AI analysis cycle across every account tier.
+
+    Paper tier (unchanged): a shadow account per strategy, plus `ai_selected` for
+    whichever strategy the AI picked. Real tier: the same signals re-sized for a
+    $100 broker account, for the subset of accounts in REAL_ACCOUNTS.
+    """
+    live = parsed.live_signal
 
     for strategy, sig in parsed.evaluations.items():
-        if not sig.ok:
-            continue
-        existing = get_open_position(session, strategy)
-        if sig.action == "CLOSE" and existing:
-            _close_trade(session, existing, current_price, TradeStatus.CLOSED_MANUAL.value)
-        elif sig.action in ("BUY", "SELL") and not existing:
-            _open_trade(
-                session,
-                strategy=strategy,
-                is_shadow=True,
-                account=strategy,
-                signal=sig,
-                analysis_id=analysis_id,
-            )
+        _apply_signal(
+            session,
+            account=strategy,
+            strategy=strategy,
+            signal=sig,
+            is_shadow=True,
+            current_price=current_price,
+            analysis_id=analysis_id,
+        )
 
-    live = parsed.live_signal
-    if live and live.ok:
-        existing = get_open_position(session, AI_SELECTED_ACCOUNT)
-        if live.action == "CLOSE" and existing:
-            _close_trade(session, existing, current_price, TradeStatus.CLOSED_MANUAL.value)
-        elif live.action in ("BUY", "SELL") and not existing:
-            _open_trade(
-                session,
-                strategy=parsed.selected_strategy,
-                is_shadow=False,
-                account=AI_SELECTED_ACCOUNT,
-                signal=live,
-                analysis_id=analysis_id,
-            )
+    _apply_signal(
+        session,
+        account=AI_SELECTED_ACCOUNT,
+        strategy=parsed.selected_strategy,
+        signal=live,
+        is_shadow=False,
+        current_price=current_price,
+        analysis_id=analysis_id,
+    )
+
+    # Real tier mirrors the same signals; sizing is what differs.
+    for account in REAL_ACCOUNTS:
+        source = real_source_for(account)
+        if source == AI_SELECTED_ACCOUNT:
+            signal, strategy = live, parsed.selected_strategy
+        else:
+            signal, strategy = parsed.evaluations.get(source), source
+        _apply_signal(
+            session,
+            account=account,
+            strategy=strategy,
+            signal=signal,
+            is_shadow=False,
+            current_price=current_price,
+            analysis_id=analysis_id,
+        )
 
     session.commit()
 

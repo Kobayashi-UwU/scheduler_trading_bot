@@ -30,6 +30,17 @@
   .reasoning { color: #8a92a6; max-width: 420px; white-space: normal; }
   .scroll { overflow-x: auto; }
   #status { color: #8a92a6; font-size: 12px; }
+  /* real-account tier — visually distinct from the paper experiment */
+  section.real h2 { color: #e8c07e; border-bottom-color: #4a3a22; }
+  .card.real { background: #1a1710; border-color: #4a3a22; }
+  .note {
+    background: #1a1710; border: 1px solid #4a3a22; border-radius: 6px;
+    padding: 8px 12px; margin: 10px 0 14px; color: #d8c9a8; font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .note code { color: #e8c07e; }
+  .warn { color: #e8b97e; }
+  .muted { color: #8a92a6; }
 </style>
 </head>
 <body>
@@ -39,6 +50,24 @@
   <section>
     <h2>Strategy Leaderboard</h2>
     <div class="grid" id="leaderboard"></div>
+  </section>
+
+  <section class="real" id="real-section" style="display:none">
+    <h2>💵 Real Account Trading</h2>
+    <div class="note" id="real-config"></div>
+    <div class="grid" id="real-leaderboard"></div>
+
+    <h3 style="font-size:13px;color:#8a92a6;text-transform:uppercase;letter-spacing:.04em;margin:0 0 6px">Open Positions</h3>
+    <div class="scroll"><table id="real-positions"><thead><tr>
+      <th>Account</th><th>Strategy</th><th>Dir</th><th>Lots</th><th>Entry</th><th>SL</th><th>TP</th>
+      <th>Risk $</th><th>Risk %</th><th>Margin</th>
+    </tr></thead><tbody></tbody></table></div>
+
+    <h3 style="font-size:13px;color:#8a92a6;text-transform:uppercase;letter-spacing:.04em;margin:16px 0 6px">Skipped Signals</h3>
+    <div class="scroll"><table id="real-skips"><thead><tr>
+      <th>Time</th><th>Account</th><th>Action</th><th>Balance</th><th>Would-be Lots</th>
+      <th>Would-be Risk</th><th>Reason</th>
+    </tr></thead><tbody></tbody></table></div>
   </section>
 
   <section>
@@ -69,10 +98,67 @@ const time = (s) => s ? new Date(s + (s.endsWith('Z') ? '' : 'Z')).toLocaleStrin
 
 async function j(url) { const r = await fetch(url); return r.json(); }
 
+let realEnabled = false;
+
 async function loadStatus() {
   const s = await j('/api/status');
   document.getElementById('status').textContent =
     `${s.symbol} · market ${s.market_open ? 'OPEN' : 'CLOSED'} · analysis every ${s.analysis_interval_min}min`;
+
+  realEnabled = s.real_enabled;
+  document.getElementById('real-section').style.display = realEnabled ? '' : 'none';
+  if (realEnabled) {
+    const c = s.real_config;
+    document.getElementById('real-config').innerHTML =
+      `<strong>Broker-accurate simulation — no live orders are placed yet.</strong> ` +
+      `Mirrors the same AI signals as the paper tier, but sized like a real account: ` +
+      `<code>$${fmt(c.start_balance,0)}</code> start · <code>1:${fmt(c.leverage,0)}</code> leverage · ` +
+      `min <code>${fmt(c.min_lot,2)}</code> lot (= ${fmt(c.min_lot * c.contract_size,0)} oz) · ` +
+      `skip above <code>${fmt(c.max_risk_pct,0)}%</code> risk.<br>` +
+      `<span class="warn">At ${fmt(c.min_lot,2)} lot the smallest possible loss is the stop distance in dollars ` +
+      `(~$7–25 on gold), so risk per trade is ~7–25% of $${fmt(c.start_balance,0)} — not the ` +
+      `${fmt(c.risk_per_trade_pct,0)}% target. Expect deep drawdowns.</span>`;
+  }
+}
+
+async function loadRealTier() {
+  if (!realEnabled) return;
+  const [stats, positions, skips] = await Promise.all([
+    j('/api/real/stats'), j('/api/real/positions'), j('/api/real/skips?limit=25'),
+  ]);
+
+  document.getElementById('real-leaderboard').innerHTML = stats.map(s => `
+    <div class="card real">
+      <h3>${s.account}</h3>
+      <div class="big ${pnlClass(s.return_pct)}">$${fmt(s.balance)} <span style="font-size:14px">(${s.return_pct >= 0 ? '+' : ''}${fmt(s.return_pct,1)}%)</span></div>
+      <div class="muted">from $${fmt(s.start_balance,0)} start</div>
+      <div>Trades: ${s.total_trades} · Win rate: ${fmt(s.win_rate_pct,0)}%</div>
+      <div>Profit factor: ${s.profit_factor === null ? '-' : fmt(s.profit_factor)} · Avg R: ${fmt(s.avg_r_multiple)}</div>
+      <div>Max drawdown: ${fmt(s.max_drawdown_pct,1)}%</div>
+      ${s.avg_risk_pct === undefined ? '' :
+        `<div class="warn">Risk/trade: avg ${fmt(s.avg_risk_pct,1)}% · max ${fmt(s.max_risk_pct,1)}%</div>`}
+    </div>
+  `).join('');
+
+  document.querySelector('#real-positions tbody').innerHTML = positions.map(p => `
+    <tr>
+      <td>${p.account}</td><td>${p.strategy}</td><td>${p.direction}</td>
+      <td>${fmt(p.lots,2)}</td>
+      <td>${fmt(p.entry_price)}</td><td>${fmt(p.stop_loss)}</td><td>${fmt(p.take_profit)}</td>
+      <td>$${fmt(p.risk_amount)}</td>
+      <td class="warn">${fmt(p.risk_pct,1)}%</td>
+      <td>$${fmt(p.margin_used)}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="10" class="muted">No open real positions</td></tr>';
+
+  document.querySelector('#real-skips tbody').innerHTML = skips.map(s => `
+    <tr>
+      <td>${time(s.created_at)}</td><td>${s.account}</td><td>${s.action}</td>
+      <td>$${fmt(s.balance)}</td><td>${fmt(s.intended_lots,2)}</td>
+      <td>$${fmt(s.intended_risk)} (${fmt(s.intended_risk_pct,1)}%)</td>
+      <td class="reasoning">${s.reason}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="7" class="muted">Nothing skipped</td></tr>';
 }
 
 async function loadLeaderboard() {
@@ -134,7 +220,9 @@ async function loadAnalyses() {
 
 async function refresh() {
   try {
-    await Promise.all([loadStatus(), loadLeaderboard(), loadPositions(), loadTrades(), loadAnalyses()]);
+    // loadStatus first: it sets realEnabled, which loadRealTier depends on.
+    await loadStatus();
+    await Promise.all([loadLeaderboard(), loadRealTier(), loadPositions(), loadTrades(), loadAnalyses()]);
   } catch (e) { console.error(e); }
 }
 
