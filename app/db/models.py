@@ -96,6 +96,23 @@ class EquityPoint(Base):
     balance: Mapped[float] = mapped_column(Float)
 
 
+class BrokerToken(Base):
+    """cTrader Open API OAuth tokens, per real-tier account. Refreshed in place by
+    app.trading.ctrader_tokens rather than kept in env vars, since the access
+    token rotates roughly every 30 days.
+    """
+
+    __tablename__ = "broker_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account: Mapped[str] = mapped_column(String, unique=True, index=True)
+    ctid_trader_account_id: Mapped[int] = mapped_column(Integer)
+    access_token: Mapped[str] = mapped_column(String)
+    refresh_token: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[DateTime] = mapped_column(DateTime)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class TradeSkip(Base):
     """A signal a real account could not act on (risk cap, margin, lot limits).
 

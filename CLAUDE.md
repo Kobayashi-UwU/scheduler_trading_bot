@@ -45,10 +45,10 @@ directly — the cycle functions are plain sync functions and safe to invoke by 
 # SQLite DB, makes no AI calls, touches nothing real. Run this after any engine/sizing edit.
 .venv/bin/python scripts/verify_real_tier.py
 
-# MT5 executor reconciler against a mock backend (open/idempotence/close/re-open guard/
-# age guard/login-failure isolation/symbol fallback/distance math). No network, no MT5.
+# cTrader executor reconciler against a mock client (open/idempotence/close/re-open
+# guard/age guard/account-auth-failure isolation/volume-cents conversion). No network.
 # Run this after any executor edit.
-.venv/bin/python scripts/verify_executor.py
+.venv/bin/python scripts/verify_ctrader_executor.py
 
 # one full analysis cycle (makes a real AI call + writes real rows to the DB)
 .venv/bin/python -c "from app.db.database import init_db; init_db(); from app.cycle import run_analysis_cycle; run_analysis_cycle()"
@@ -72,8 +72,7 @@ Two feature flags gate whole subsystems: `REAL_ENABLED` (default true) — when 
 `REAL_ACCOUNTS` is empty and `ALL_ACCOUNTS` collapses to the paper tier; and
 `EXECUTOR_ENABLED` (default **false**) — the executor sync job is only registered with the
 scheduler when it is on. `app.trading.executor` is imported lazily inside
-`start_scheduler`, and `mt5linux` itself only inside `Mt5LinuxBackend.connect`, so neither
-a disabled executor nor a missing `mt5linux` can break startup. Also note `REAL_ACCOUNTS`
+`start_scheduler`, so a disabled executor can't break startup. Also note `REAL_ACCOUNTS`
 names are validated against `PAPER_ACCOUNTS` at import: an unknown name is dropped with a
 warning rather than silently creating a dead account.
 
@@ -328,38 +327,64 @@ Other defined-but-unused code, so you don't assume it's load-bearing: the `Direc
 and `Analysis.trade_id` column in `models.py` (`Trade.direction` is a plain string, and the
 Analysis→Trade link exists only as `Trade.analysis_id`), and `yahoo.get_current_price()`.
 
-### MT5 executor (mirroring the real tier onto broker accounts)
+### cTrader executor (mirroring the real tier onto broker accounts)
 
-`app/trading/executor.py` mirrors the real-tier sim positions onto live MT5 accounts
-(currently Exness **demo**). Core design decisions, all deliberate:
+`app/trading/executor.py` mirrors the real-tier sim positions onto live cTrader accounts
+(currently Axiory **demo**), talking directly to the **cTrader Open API** — a protobuf
+protocol over a TLS TCP socket (`app/trading/ctrader_client.py`). This replaced an earlier
+MT5/Wine-container executor that used too much Railway memory and never fully worked; there
+is no terminal/VM process at all now, just a socket connection. Core design decisions, all
+deliberate:
 
 - **Reconciliation, not event-forwarding.** Each sync (scheduler job, every
   `EXECUTOR_SYNC_INTERVAL_MIN`) compares the sim's open position per real account (from
-  the DB) with broker positions tagged `EXECUTOR_MAGIC`, and issues the minimal orders to
-  converge. Stateless across restarts; SL/TP live server-side at the broker, so positions
-  stay protected even if everything here dies.
+  the DB) with broker positions tagged via the order's `label` field (`sim:{trade_id}`,
+  cTrader's equivalent of MT5's magic-number+comment), and issues the minimal orders to
+  converge. Stateless across restarts; SL/TP live server-side at the broker.
+- **Fresh connection per sync pass, not a persistent one.** The whole exchange (app-auth,
+  per-account auth, reconcile, any orders) takes a few seconds — well under the API's
+  ~30s idle-disconnect window — so there's no heartbeat thread; `CTraderClient` connects,
+  does the pass, and closes. One connection authorizes every configured account in turn
+  (the API supports many account-auths per connection — no need for one socket per account).
 - **Distances, not absolute prices.** The bot's levels come from Yahoo `GC=F` (COMEX
   futures), a few dollars off broker spot XAUUSD. Mirrors open at market and re-derive
   SL/TP by preserving the sim trade's stop/target distances around the actual fill.
   Never "fix" this by copying absolute prices.
-- **One terminal, many logins.** MT5's `login()` switches the terminal between accounts,
-  so one Wine container serves every account sequentially. Account→login mapping lives in
-  `EXECUTOR_ACCOUNTS` (JSON env var; credentials only in Railway variables, never in git).
-- Guards: `executor_max_open_age_min` (no late mirrors at drifted prices), an in-memory
-  `_opened_once` set (no re-open when the broker's SL fires before the sim's price check
-  notices), symbol fallback for Exness suffixes (`XAUUSD` → `XAUUSDm`…), and FOK→IOC
-  filling-mode fallback. Status surfaces at `/api/executor/status`.
-- The MT5 API is reached via an **mt5linux rpyc bridge** (`rpyc.classic`, port 8001 by
-  convention) running inside the Wine/MT5 container. `mt5linux` MUST be installed with
-  `--no-deps` (its numpy/urllib3 pins are stale and unresolvable on Python 3.12; only
-  `rpyc` is actually needed) — that's why it is absent from `requirements.txt` and
-  installed as a separate step in both `Dockerfile` and `Makefile`.
+- **SL/TP can't be set in the same request as a MARKET order** — the API's own
+  `ProtoOANewOrderReq` schema documents `stopLoss`/`takeProfit` as unsupported on MARKET
+  orders. So `_open_mirror` places a bare market order, reads the fill price back off the
+  `ProtoOAExecutionEvent`, then issues a follow-up `ProtoOAAmendPositionSLTPReq`. There is
+  a brief window with no protective stop between fill and amend; unavoidable given the
+  protocol.
+- **Volume unit conversion is derived from the broker's own symbol metadata, never
+  hardcoded.** cTrader volumes are all in "cents of a unit" (real units × 100); `to_volume`/
+  `to_lots` in `ctrader_client.py` convert using that symbol's own `lotSize`, fetched fresh
+  each sync pass via `ProtoOASymbolsListReq`/`ProtoOASymbolByIdReq`.
+- **OAuth tokens live in the DB, not env vars.** A cTrader access token rotates roughly
+  every 30 days; `BrokerToken` (`app/db/models.py`) holds `ctid_trader_account_id` +
+  `access_token`/`refresh_token`/`expires_at` per account, and `app/trading/ctrader_tokens.py`
+  refreshes proactively (`CTRADER_TOKEN_REFRESH_MARGIN_DAYS`) rather than waiting for an
+  auth failure. If multiple accounts share one underlying OAuth grant (one cTrader ID can
+  hold several trading accounts), refreshing updates every `BrokerToken` row still on the
+  old `access_token` together — otherwise a sibling account's stored `refresh_token` would
+  get silently invalidated out from under it. Seed these rows once (or after adding a new
+  mirrored account) via `scripts/ctrader_oauth_setup.py`, which drives the one-time OAuth
+  browser-consent flow through a local loopback HTTP server and auto-matches discovered
+  accounts to `real_*` names by `traderLogin`.
+- Guards preserved from the MT5 design: `executor_max_open_age_min` (no late mirrors at
+  drifted prices), an in-memory `_opened_once` set (no re-open when the broker's SL fires
+  before the sim's price check notices). Status surfaces at `/api/executor/status`.
+- The `ctrader-open-api` pip package is deliberately **not** a dependency — it hard-pins
+  Twisted plus protobuf==3.20.1 (no Python 3.12 wheel). Instead, `app/trading/ctrader_proto/`
+  vendors plain `*_pb2.py` classes compiled once from `spotware/openapi-proto-messages` (see
+  that package's `__init__.py` for the regen command); only a modern `protobuf` is a real
+  runtime dependency.
 
-`scripts/verify_executor.py` tests the whole reconciler against a mock backend (open /
-idempotence / close / re-open guard / age guard / login-failure isolation / symbol
-fallback / distance math). Run it after touching the executor. The real order path
-(`Mt5LinuxBackend` → Wine terminal → Exness) cannot run in this environment — it can only
-be validated on Railway against the demo accounts.
+`scripts/verify_ctrader_executor.py` tests the whole reconciler against a mock client (open /
+idempotence / close / re-open guard / age guard / account-auth-failure isolation / volume
+conversion). Run it after touching the executor. The real order path (`CTraderClient` →
+Open API → Axiory) cannot run in this environment — it can only be validated with real
+`BrokerToken` rows against the demo accounts.
 
 ## Deployment
 
@@ -369,40 +394,11 @@ process, so scaling to more than one replica would double-execute every cycle an
 account's trades. `DATABASE_URL` is swapped to Railway's Postgres plugin URL in production;
 SQLite is for local dev only.
 
-The MT5 terminal is a **second Railway service** (MT5 is Windows-only, so it runs under
-Wine), built from `mt5-terminal/Dockerfile` — a thin wrapper over `gmag11/metatrader5_vnc`
-that adds one file. It is reached over Railway's private network at
-`MT5_BRIDGE_HOST:MT5_BRIDGE_PORT`, needs a volume (the terminal installs itself into
-`/config` on first boot), and exposes a web-VNC UI for eyeballing the terminal. The main
-bot works fine when this service is down — sync just records "cannot reach MT5 bridge" and
-retries.
-
-That wrapper exists because the stock image's own rpyc-bridge step never comes up. Each
-piece of `mt5-terminal/mt5-bridge` was paid for in failed deploys; the file's comments
-record the symptom behind each one, and none of it is decoration:
-
-- It is installed into **`/custom-services.d/`**, not as a `CMD`/entrypoint override. That
-  is linuxserver.io's supported hook for a supervised background process, and it runs
-  *after* KasmVNC/X and the image's own `/Metatrader/start.sh`. A `CMD` override runs
-  before all of that, with no `DISPLAY`, wrong user, and no initialized Wine prefix
-  (`wine python` → `ShellExecuteEx failed: File not found`).
-- It starts the rpyc `SlaveService` **directly under `wine python`** instead of using
-  `start.sh`'s `python3 -m mt5linux ... -w wine python.exe`: `start.sh` installs
-  `mt5linux>=0.1.9` unpinned, and the current release dropped the `-w` flag that command
-  needs. A `rpyc.classic`-style `SlaveService` is exactly what the client side
-  (`rpyc.classic.connect` + `import MetaTrader5`) expects.
-- It downgrades the Wine-side numpy to **`<2`**: `start.sh` installs `MetaTrader5==5.0.36`,
-  whose compiled extension is built against the numpy 1.x ABI, so under numpy 2.x the port
-  binds and accepts connections but the client's remote `import MetaTrader5` dies with
-  `_ARRAY_API not found`.
-- It **sleeps 180s before touching wine at all**. `start.sh` does its own Wine/MT5/Python
-  setup concurrently; racing it during prefix init shows up as
-  `wine: could not load kernel32.dll`. A fixed wait, deliberately, because the real install
-  paths are Windows-side and unreliable to probe from Linux. Don't replace it with a
-  "smarter" readiness check without being able to test on Railway.
-- The `COPY mt5-terminal/mt5-bridge ...` path assumes the **repo root** as build context —
-  set the service's root directory accordingly, not to `mt5-terminal/`.
-
-Related, in `app/trading/executor.py`: MT5 enum constants (`ORDER_TYPE_BUY`,
-`TRADE_RETCODE_DONE`, …) are inlined as literals because the rpyc proxy exposes the remote
-module's *functions* but not its module-level constants.
+No second Railway service is needed for the executor: the cTrader Open API is a plain
+TLS socket the main container dials out to directly (`demo.ctraderapi.com`/
+`live.ctraderapi.com:5035`), replacing an earlier design that ran a whole separate
+Wine/VNC/MT5-terminal container (`mt5-terminal/`, since deleted) just to reach a
+Windows-only MT5 terminal via an `mt5linux` rpyc bridge — that approach used far more
+Railway memory than the bot itself and is why the executor was rewritten against cTrader.
+The main bot works fine when the executor can't reach the API — `sync_all` just records
+the error on `/api/executor/status` and retries next pass.

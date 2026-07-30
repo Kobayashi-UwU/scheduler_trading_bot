@@ -11,7 +11,9 @@ pydantic==2.10.4
 pydantic-settings==2.7.0
 python-dotenv==1.0.1
 httpx==0.28.1
-rpyc==6.0.2
-# NOTE: mt5linux (the MT5 bridge client) is installed separately with --no-deps
-# (see Dockerfile/Makefile) — its declared pins (numpy==1.21.4 etc.) are stale
-# and don't resolve on Python 3.12, but the client itself only needs rpyc.
+# cTrader Open API message classes are vendored (app/trading/ctrader_proto/), not
+# pip-installed, to avoid the official ctrader-open-api package's Twisted +
+# protobuf==3.20.1 pins (no Python 3.12 wheel). Only the protobuf runtime itself
+# is a real dependency, pinned to match the version the vendored *_pb2.py files
+# were generated with.
+protobuf==7.35.1

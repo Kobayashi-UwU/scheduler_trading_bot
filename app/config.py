@@ -47,23 +47,30 @@ class Settings(BaseSettings):
     # This is the ceiling on that overshoot: signals needing more are skipped.
     real_max_risk_pct: float = 0.30
 
-    # --- MT5 executor (mirrors the real tier onto live broker accounts) ----
+    # --- cTrader executor (mirrors the real tier onto live cTrader accounts) ---
     # Off by default: the sim runs fine without it. When enabled, a scheduler job
-    # reconciles each real account's sim position onto its MT5 login via the
-    # mt5linux bridge in the Wine/MT5 container.
+    # reconciles each real account's sim position onto its cTrader account via the
+    # Open API (protobuf over TLS TCP — see app/trading/ctrader_client.py). No
+    # container/terminal process needed, unlike the old MT5/Wine approach.
     executor_enabled: bool = False
     executor_sync_interval_min: int = 1
     executor_symbol: str = "XAUUSD"
-    executor_symbol_fallbacks: str = "XAUUSDm,XAUUSDc"
-    executor_magic: int = 620717  # tags our orders; leave alone once live
-    executor_deviation_points: int = 50
     # Don't open a mirror for a sim position older than this — late fills at a
     # drifted price would no longer resemble the sim trade.
     executor_max_open_age_min: int = 30
-    # JSON: {"real_ai_selected": {"login": 123, "password": "...", "server": "..."}}
+    # JSON: {"real_ai_selected": {"ctid_trader_account_id": 12345678}}
+    # Access/refresh tokens are NOT stored here — see app/db/models.py BrokerToken
+    # and scripts/ctrader_oauth_setup.py.
     executor_accounts: str = ""
-    mt5_bridge_host: str = "mt5.railway.internal"
-    mt5_bridge_port: int = 8001
+
+    # Spotware Open API application credentials (shared across every account this
+    # app authorizes — one app can auth multiple trading accounts on one connection).
+    ctrader_client_id: str = ""
+    ctrader_client_secret: str = ""
+    ctrader_environment: str = "demo"  # "demo" or "live" — picks the API host
+    # Refresh an access token proactively once it's within this many days of
+    # expiring, instead of waiting for an auth failure and parsing an error code.
+    ctrader_token_refresh_margin_days: int = 3
 
     database_url: str = "sqlite:///./data/trading_bot.db"
 

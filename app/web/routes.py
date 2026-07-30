@@ -110,7 +110,7 @@ def real_positions():
 
 @router.get("/api/executor/status")
 def executor_status():
-    """Health of the MT5 mirror (last sync, last action, errors per account)."""
+    """Health of the cTrader mirror (last sync, last action, errors per account)."""
     from app.trading.executor import STATUS
 
     return {"enabled": settings.executor_enabled, **STATUS}

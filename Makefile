@@ -21,7 +21,6 @@ venv:
 install: venv
 	$(PIP) install -q --upgrade pip
 	$(PIP) install -q -r requirements.txt
-	$(PIP) install -q --no-deps mt5linux==0.1.9
 
 up: install
 	mkdir -p logs data
