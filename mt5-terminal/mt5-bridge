@@ -16,6 +16,16 @@
 # succeeds), which is exactly what the mt5linux CLIENT side (rpyc.classic.
 # connect + "import MetaTrader5 as mt5") expects on the other end.
 
+# start.sh (this image's own MT5 autostart) does its own Wine/MT5/Python
+# setup concurrently with this service starting. Running "wine python" while
+# that's still in progress races the wineserver during prefix initialization
+# -- observed directly as "wine: could not load kernel32.dll" -- so wait out
+# the whole sequence (observed to reliably finish within ~110s, whether
+# freshly installing or just re-launching an already-installed prefix) before
+# touching wine at all. A fixed wait, not a file/process check: exact Wine
+# install paths are Windows-side and unreliable to probe from Linux.
+sleep 180
+
 i=0
 while [ $i -lt 60 ]; do
   s6-setuidgid abc wine python -c "import rpyc, MetaTrader5" 2>/dev/null && break
