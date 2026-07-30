@@ -45,6 +45,11 @@ directly — the cycle functions are plain sync functions and safe to invoke by 
 # SQLite DB, makes no AI calls, touches nothing real. Run this after any engine/sizing edit.
 .venv/bin/python scripts/verify_real_tier.py
 
+# MT5 executor reconciler against a mock backend (open/idempotence/close/re-open guard/
+# age guard/login-failure isolation/symbol fallback/distance math). No network, no MT5.
+# Run this after any executor edit.
+.venv/bin/python scripts/verify_executor.py
+
 # one full analysis cycle (makes a real AI call + writes real rows to the DB)
 .venv/bin/python -c "from app.db.database import init_db; init_db(); from app.cycle import run_analysis_cycle; run_analysis_cycle()"
 
@@ -62,6 +67,15 @@ All settings come from `app/config.py` (`pydantic-settings`), loaded from `.env`
 `RISK_PER_TRADE`, `MIN_CONFIDENCE`, `MIN_RISK_REWARD`, `DATABASE_URL` (defaults to local
 SQLite; Railway sets this to Postgres — note Railway gives `postgres://` and `config.py`
 normalizes it to `postgresql://` for SQLAlchemy).
+
+Two feature flags gate whole subsystems: `REAL_ENABLED` (default true) — when false,
+`REAL_ACCOUNTS` is empty and `ALL_ACCOUNTS` collapses to the paper tier; and
+`EXECUTOR_ENABLED` (default **false**) — the executor sync job is only registered with the
+scheduler when it is on. `app.trading.executor` is imported lazily inside
+`start_scheduler`, and `mt5linux` itself only inside `Mt5LinuxBackend.connect`, so neither
+a disabled executor nor a missing `mt5linux` can break startup. Also note `REAL_ACCOUNTS`
+names are validated against `PAPER_ACCOUNTS` at import: an unknown name is dropped with a
+warning rather than silently creating a dead account.
 
 Two settings exist but are **not enforced by any code**:
 
@@ -203,9 +217,12 @@ capital. Consequences to keep in mind:
   skipping would read as "no signal".
 - Losses compound the problem: after one $17 loss on $100, the same $25 stop is 30% of what
   remains, so the cap starts rejecting trades a full-size account would take.
-- Margin is checked as `lots * contract_size * entry / leverage <= balance`. At 1:100 a 0.01
-  lot of gold needs ~$41 of a $100 balance; below roughly 1:45 no position can be opened at
-  all, which is why `REAL_LEVERAGE` is not cosmetic.
+- Margin is checked as `lots * contract_size * entry / leverage <= balance`, and only after
+  the risk cap. `REAL_LEVERAGE` defaults to **2000** (matching the demo broker account), so
+  a 0.01 lot of ~$4,100 gold ties up ~$2 and the margin guard effectively never fires; it
+  only starts rejecting trades around 1:45 or lower. Leverage does not change risk per
+  trade — the stop distance sets that — it only changes locked margin, so don't reach for
+  it as a risk knob.
 - Paper sizing is untouched: `risk_amount / stop_distance` in oz, always hitting 1% exactly.
   `Trade.lots` / `margin_used` / `risk_pct` are NULL for paper trades and populated for real
   ones — that NULL-ness is the cheapest way to tell the tiers apart in raw SQL.
@@ -244,7 +261,9 @@ The web layer (`app/web/routes.py`) is a thin read-only JSON API over the same
 per-account abstractions (`ALL_ACCOUNTS`, `compute_stats`) — it never writes trades itself.
 The frontend is a single static file served directly by FastAPI (`app/web/static/index.html`,
 mounted at `/` via `StaticFiles`), not a separate build: vanilla JS polling
-`/api/status`, `/api/stats`, `/api/positions`, `/api/trades`, `/api/analyses`. Note the
+`/api/status`, `/api/stats`, `/api/positions`, `/api/trades`, `/api/analyses`, plus the
+real tier's `/api/real/stats`, `/api/real/positions`, `/api/real/skips`. (`/api/candles`,
+`/api/stats/{account}` and `/api/executor/status` are served but nothing calls them.) Note the
 route mount order — `include_router(router)` before the `/` `StaticFiles` mount is what
 keeps `/api/*` reachable.
 
@@ -273,7 +292,7 @@ existing strategy's track record.
 
 ## Persistence
 
-SQLAlchemy ORM (`app/db/models.py`: `Analysis`, `Trade`, `EquityPoint`) over SQLite
+SQLAlchemy ORM (`app/db/models.py`: `Analysis`, `Trade`, `EquityPoint`, `TradeSkip`) over SQLite
 locally / Postgres on Railway (`app/db/database.py`).
 
 - Schema is created with `Base.metadata.create_all` at startup, and because `create_all` only
@@ -351,8 +370,39 @@ account's trades. `DATABASE_URL` is swapped to Railway's Postgres plugin URL in 
 SQLite is for local dev only.
 
 The MT5 terminal is a **second Railway service** (MT5 is Windows-only, so it runs under
-Wine): a stock `gmag11/metatrader5_vnc` image, no repo code, reached over Railway's
-private network at `MT5_BRIDGE_HOST:MT5_BRIDGE_PORT`. It needs a volume (the terminal
-installs itself into `/config` on first boot) and exposes a web-VNC UI for eyeballing the
-terminal. The main bot works fine when this service is down — sync just records
-"cannot reach MT5 bridge" and retries.
+Wine), built from `mt5-terminal/Dockerfile` — a thin wrapper over `gmag11/metatrader5_vnc`
+that adds one file. It is reached over Railway's private network at
+`MT5_BRIDGE_HOST:MT5_BRIDGE_PORT`, needs a volume (the terminal installs itself into
+`/config` on first boot), and exposes a web-VNC UI for eyeballing the terminal. The main
+bot works fine when this service is down — sync just records "cannot reach MT5 bridge" and
+retries.
+
+That wrapper exists because the stock image's own rpyc-bridge step never comes up. Each
+piece of `mt5-terminal/mt5-bridge` was paid for in failed deploys; the file's comments
+record the symptom behind each one, and none of it is decoration:
+
+- It is installed into **`/custom-services.d/`**, not as a `CMD`/entrypoint override. That
+  is linuxserver.io's supported hook for a supervised background process, and it runs
+  *after* KasmVNC/X and the image's own `/Metatrader/start.sh`. A `CMD` override runs
+  before all of that, with no `DISPLAY`, wrong user, and no initialized Wine prefix
+  (`wine python` → `ShellExecuteEx failed: File not found`).
+- It starts the rpyc `SlaveService` **directly under `wine python`** instead of using
+  `start.sh`'s `python3 -m mt5linux ... -w wine python.exe`: `start.sh` installs
+  `mt5linux>=0.1.9` unpinned, and the current release dropped the `-w` flag that command
+  needs. A `rpyc.classic`-style `SlaveService` is exactly what the client side
+  (`rpyc.classic.connect` + `import MetaTrader5`) expects.
+- It downgrades the Wine-side numpy to **`<2`**: `start.sh` installs `MetaTrader5==5.0.36`,
+  whose compiled extension is built against the numpy 1.x ABI, so under numpy 2.x the port
+  binds and accepts connections but the client's remote `import MetaTrader5` dies with
+  `_ARRAY_API not found`.
+- It **sleeps 180s before touching wine at all**. `start.sh` does its own Wine/MT5/Python
+  setup concurrently; racing it during prefix init shows up as
+  `wine: could not load kernel32.dll`. A fixed wait, deliberately, because the real install
+  paths are Windows-side and unreliable to probe from Linux. Don't replace it with a
+  "smarter" readiness check without being able to test on Railway.
+- The `COPY mt5-terminal/mt5-bridge ...` path assumes the **repo root** as build context —
+  set the service's root directory accordingly, not to `mt5-terminal/`.
+
+Related, in `app/trading/executor.py`: MT5 enum constants (`ORDER_TYPE_BUY`,
+`TRADE_RETCODE_DONE`, …) are inlined as literals because the rpyc proxy exposes the remote
+module's *functions* but not its module-level constants.
