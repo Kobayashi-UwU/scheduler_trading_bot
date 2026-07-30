@@ -15,6 +15,16 @@
 # a plain SlaveService running under Wine's python (so "import MetaTrader5"
 # succeeds), which is exactly what the mt5linux CLIENT side (rpyc.classic.
 # connect + "import MetaTrader5 as mt5") expects on the other end.
+#
+# start.sh's own "pip install MetaTrader5==5.0.36" pulls in numpy unpinned
+# ("numpy>=1.7"), which resolves to the latest 2.x -- but the MetaTrader5
+# wheel's compiled extension was built against numpy 1.x's ABI, so any
+# "import MetaTrader5" under it fails immediately with "AttributeError:
+# _ARRAY_API not found" (confirmed directly: the bridge accepted a
+# connection and bound the port fine, but the remote "import MetaTrader5"
+# the mt5linux client triggers crashed with exactly this). Downgrading here,
+# after start.sh's own install, is the only lever available short of
+# patching start.sh itself.
 
 # start.sh (this image's own MT5 autostart) does its own Wine/MT5/Python
 # setup concurrently with this service starting. Running "wine python" while
@@ -25,6 +35,8 @@
 # touching wine at all. A fixed wait, not a file/process check: exact Wine
 # install paths are Windows-side and unreliable to probe from Linux.
 sleep 180
+
+s6-setuidgid abc wine python -m pip install --no-cache-dir "numpy<2" 2>&1
 
 i=0
 while [ $i -lt 60 ]; do
