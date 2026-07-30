@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Thin wrapper around gmag11/metatrader5_vnc: fixes its own start.sh's final
 # step, which never starts the rpyc bridge (see entrypoint.sh for why).
 # Deployed as its own Railway service, separate from the main bot -- it only
