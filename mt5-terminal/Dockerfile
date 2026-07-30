@@ -4,7 +4,7 @@
 # runs an MT5 terminal + rpyc bridge, not the trading app itself.
 FROM gmag11/metatrader5_vnc:latest
 
-COPY entrypoint.sh /entrypoint.sh
+COPY mt5-terminal/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 CMD ["/entrypoint.sh"]
